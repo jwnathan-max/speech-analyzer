@@ -22,6 +22,7 @@ import anthropic
 import pdfplumber
 import pypdfium2 as pdfium
 import streamlit as st
+from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -131,14 +132,28 @@ def transcribe_audio(uploaded_file) -> str:
 # ── 골자 PDF 로드 ─────────────────────────────────────────────────────────────
 
 def load_outline(outline_number: str) -> str:
-    """로컬 outlines_pdf/ 폴더에서 골자 PDF를 읽어 텍스트로 반환한다."""
+    """로컬 outlines_pdf/ 폴더에서 골자 파일(PDF 또는 DOCX)을 읽어 텍스트로 반환한다."""
     pdf_path = OUTLINE_DIR / f"S-34_KO_{outline_number}.pdf"
-    if not pdf_path.exists():
-        raise FileNotFoundError(
-            f"`outlines_pdf/S-34_KO_{outline_number}.pdf` 파일을 찾을 수 없습니다. "
-            "해당 PDF를 outlines_pdf/ 폴더에 추가해 주세요."
-        )
-    return _extract_pdf_text(pdf_path)
+    docx_path = OUTLINE_DIR / f"S-34_KO_{outline_number}.docx"
+    if pdf_path.exists():
+        return _extract_pdf_text(pdf_path)
+    if docx_path.exists():
+        return _extract_docx_text(docx_path)
+    raise FileNotFoundError(
+        f"`outlines_pdf/S-34_KO_{outline_number}.pdf` 또는 `.docx` 파일을 찾을 수 없습니다. "
+        "해당 파일을 outlines_pdf/ 폴더에 추가해 주세요."
+    )
+
+
+def _extract_docx_text(path: Path) -> str:
+    doc = Document(str(path))
+    parts: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                parts.append("\t".join(cells))
+    return _clean_text("\n".join(parts))
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -240,23 +255,26 @@ def render_results(analysis: dict, notion_url: str = "") -> None:
     st.divider()
 
     # ── 제목 & 점수 ──────────────────────────────────────────────────────────
-    col_title, col_score = st.columns([3, 1])
-    with col_title:
+    has_adherence = bool(adherence)
+    if has_adherence:
+        col_title, col_score = st.columns([3, 1])
+        with col_title:
+            st.header(f"🎙️ {topic}")
+        with col_score:
+            score_color = (
+                "#28a745" if score >= 80 else "#fd7e14" if score >= 60 else "#dc3545"
+            )
+            st.markdown(
+                f"<div style='text-align:center;margin-top:1.1rem'>"
+                f"<span style='font-size:2rem;font-weight:bold;color:{score_color}'>{score}</span>"
+                f"<span style='color:#888;font-size:1rem'>점</span></div>",
+                unsafe_allow_html=True,
+            )
+        st.progress(score / 100)
+        if notes:
+            st.caption(f"📝 {notes}")
+    else:
         st.header(f"🎙️ {topic}")
-    with col_score:
-        score_color = (
-            "#28a745" if score >= 80 else "#fd7e14" if score >= 60 else "#dc3545"
-        )
-        st.markdown(
-            f"<div style='text-align:center;margin-top:1.1rem'>"
-            f"<span style='font-size:2rem;font-weight:bold;color:{score_color}'>{score}</span>"
-            f"<span style='color:#888;font-size:1rem'>점</span></div>",
-            unsafe_allow_html=True,
-        )
-
-    st.progress(score / 100)
-    if notes:
-        st.caption(f"📝 {notes}")
 
     # ── 태그 칩 ──────────────────────────────────────────────────────────────
     if scriptures:
@@ -422,14 +440,12 @@ if submitted:
     if not audio_file:
         st.error("음성 파일을 업로드해 주세요.")
         st.stop()
-    if not outline_number.strip():
-        st.error("골자 번호를 입력해 주세요 (예: 001).")
-        st.stop()
 
-    num_clean = outline_number.strip().zfill(3)
+    num_clean = outline_number.strip().zfill(3) if outline_number.strip() else ""
     analysis: dict = {}
     notion_url = ""
     pipeline_error = ""  # status 밖에서 표시할 에러 메시지
+    outline_text = ""
 
     with st.status("📡 분석을 진행하고 있습니다...", expanded=True) as status:
 
@@ -442,8 +458,8 @@ if submitted:
             pipeline_error = f"음성 변환 실패: {exc}"
             status.update(label="❌ 음성 변환 실패", state="error")
 
-        # Step 2: 골자 PDF 로드
-        if not pipeline_error:
+        # Step 2: 골자 PDF 로드 (골자 번호가 있을 때만)
+        if not pipeline_error and num_clean:
             st.write("📄 골자 PDF 불러오는 중...")
             try:
                 outline_text = load_outline(num_clean)
@@ -474,7 +490,7 @@ if submitted:
                     "speaker":        speaker.strip(),
                     "date":           str(talk_date) if talk_date else "",
                     "source":         "audio",
-                    "outline_number": int(num_clean),
+                    "outline_number": int(num_clean) if num_clean else None,
                 }
                 notion_url = create_talk(
                     metadata,
