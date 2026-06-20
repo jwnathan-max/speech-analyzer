@@ -252,12 +252,13 @@ def analyze_speech(
             speech=speech_text.strip(),
         )
 
-    message = client.messages.create(
+    with client.messages.stream(
         model=MODEL,
         max_tokens=32000,
         system=system,
         messages=[{"role": "user", "content": user_message}],
-    )
+    ) as stream:
+        message = stream.get_final_message()
 
     raw_output = message.content[0].text.strip()
     return _parse_json_response(raw_output)
