@@ -238,14 +238,14 @@ def _print_analysis_summary(analysis: dict, page_url: str) -> None:
     search_tags = analysis.get("search_tags", {})
     scriptures = search_tags.get("scriptures", [])
     illustrations = search_tags.get("illustrations", [])
-    main_points = analysis.get("structure_and_flow", {}).get("main_points", [])
+    scripture_analysis = analysis.get("scripture_analysis") or []
 
     summary = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
     summary.add_column(style="bold cyan", width=16, no_wrap=True)
     summary.add_column()
     summary.add_row("주제", analysis.get("topic", "-"))
     summary.add_row("골자 일치도", f"{score}점  {notes[:60] + '...' if len(notes) > 60 else notes}")
-    summary.add_row("본론 사상 수", f"{len(main_points)}개")
+    summary.add_row("분석된 성구 수", f"{len(scripture_analysis)}개")
     summary.add_row("주요 성구", f"{len(scriptures)}개")
     summary.add_row("비유 주제", ", ".join(illustrations) if illustrations else "-")
     console.print(summary)
