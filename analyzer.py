@@ -1,6 +1,7 @@
 """
 analyzer.py
-Claude(claude-sonnet-4-6)를 사용해 연설 텍스트와 골자를 비교 분석한다.
+Claude(Sonnet 5.5)를 사용해 연설 텍스트와 골자를 비교 분석한다.
+강연 흐름 분석 1회 + 성구별 6렌즈 분석을 병렬로 실행해 시간을 줄인다.
 
 Public API:
   analyze_speech(speech_text, outline_text, *, anthropic_api_key) -> dict
@@ -8,10 +9,13 @@ Public API:
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional
 
 import anthropic
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5-5"
+LENS_WORKERS = 6  # 6렌즈 동시 요청 수
 
 # ── 시스템 프롬프트 ─────────────────────────────────────────────────────────
 
@@ -65,15 +69,7 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
               "example_used": "예/비유/실화를 사용했는지 (boolean)",
               "application_made": "구체적 적용점을 제시했는지 (boolean)"
             },
-            "delivery_technique": "낭독→설명→예화→적용 4단계를 연사가 실제로 어떤 순서·비중·연결로 풀어냈는지에 대한 질적 평가(3~5줄). 단계가 생략되었으면 왜 생략해도 흐름상 자연스러웠는지(또는 아쉬웠는지) 평가. boolean 체크리스트(process_applied)의 반복 서술 금지 — '어떻게' 사용했는지의 기법적 완성도·자연스러움·설득력에 집중. (string)",
-            "six_lens_analysis": {
-              "expression": "[렌즈1-표현] 출판물의 해석 방향, 상호 참조 성구, 히브리어/그리스어 원어 뉘앙스, 신세계역 외 번역본 비교, 문맥상 역할, 평행 성구 비교 중 이 성구에 실제로 의미 있게 적용되는 통찰만 종합 서술. translation_notes(연설자가 직접 언급한 번역 비교)와 중복 금지 — 이 필드는 분석가가 보충하는 원어·문맥·평행성구 통찰. 의미 있는 내용이 없으면 null. (string)",
-              "author": "[렌즈2-필자] 이 성구를 기록한 필자가 누구이며 어떤 상황(포로기·박해·선교여정 등)에서, 언제, 어디서, 무엇을, 왜 기록했는지와 그 기록 목적(경고/위로/교정/역사보존/예언성취)이 본문 선택에 어떻게 반영되었는지. 의미 있는 내용이 없으면 null. (string)",
-              "context": "[렌즈3-배경] 사회·경제(계층·직업·경제상황), 도덕·종교(주변민족 관습·우상숭배·율법환경), 상황·장면(날씨·시간대·공간), 인물의 직업·출신배경 중 이 성구에 실제로 적용되는 것만 서술. context_background 필드와 중복 금지 — 이 필드는 더 구체적인 사회·종교·장면적 배경. 의미 있는 내용이 없으면 null. (string)",
-              "emotion": "[렌즈4-감정] 본문 속 인물이 느낀 감정(두려움·의심·기쁨·분노·슬픔 등)과 그 심화·전환 과정, 현대 독자의 공감 포인트, 상황과 감정의 상호작용. 인물의 감정선이 뚜렷하지 않은 교훈적 성구라면 null. (string)",
-              "timeline": "[렌즈5-연대] 선행 사건과의 인과관계, 여호와의 시간표(카이로스)와 인간 기대 시점의 차이, 헬라어 시제가 단회/반복을 시사하는지(해당시), 이 사건의 단기·장기 연쇄효과, 예언-성취 간격, 동시대 성서인물 비교. 연대적 요소가 없는 성구라면 null. (string)",
-              "jehovah": "[렌즈6-여호와] 여호와께서 이 내용을 성경에 포함하신 이유, 사건 처리 방식(직접개입/침묵/위임), 두드러지는 속성(사랑·공의·지혜·인내·능력), 제시되는 도덕적·영적 표준, 시대를 초월하는 핵심 원칙, 사용된 비유·상징의 심층 의미. 의미 있는 내용이 없으면 null. (string)"
-            }
+            "delivery_technique": "낭독→설명→예화→적용 4단계를 연사가 실제로 어떤 순서·비중·연결로 풀어냈는지에 대한 질적 평가(3~5줄). 단계가 생략되었으면 왜 생략해도 흐름상 자연스러웠는지(또는 아쉬웠는지) 평가. boolean 체크리스트(process_applied)의 반복 서술 금지 — '어떻게' 사용했는지의 기법적 완성도·자연스러움·설득력에 집중. (string)"
           }
           ],
           "transition": "다음 요점(또는 다음 부분)으로 어떻게 넘어갔는지와 연결의 자연스러움 1~2줄. 강연의 마지막 요점이면 null. (string)"
@@ -106,7 +102,7 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
 - explanation: 요점을 어떤 논리로 풀어 설명했는지 구체적으로 쓸 것. "잘 설명했다" 같은 일반론 금지.
 - illustrations: 해당 요점에서 사용한 예·비유·경험담·질문 등을 빠짐없이 기록하라. 단, 특정 성구를 설명하면서 쓴 비유는 그 성구의 illustration_detail에만 쓰고 여기에 중복하지 말 것. 없으면 빈 배열 [].
 - scriptures: 해당 요점에서 다룬 성구를 등장 순서대로 넣어라. 성구가 없는 요점은 빈 배열 [].
-- 연설에 등장한 모든 성구는 talk_flow 안에 정확히 한 번 들어가야 한다. 같은 성구를 여러 요점에서 다시 언급했다면 가장 비중 있게 다룬 요점에 넣어라.
+- 연설에 등장한 모든 성구는 talk_flow 안에 정확히 한 번 들어가야 한다 (구절 범위는 한 항목으로 묶음). 같은 성구를 여러 요점에서 다시 언급했다면 가장 비중 있게 다룬 요점에 넣어라.
 - 연설 제목/주제 자체는 talk_flow에 넣지 말 것 (topic 필드 전용).
 
 [성구 분석 규칙 (talk_flow[].points[].scriptures)]
@@ -117,12 +113,6 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
   (4) 깊은 묵상점(deep_meditation)을 이끌어냈는지
 - translation_notes와 deep_meditation은 연설자가 실제로 다루지 않았다면 반드시 null로 둘 것. 추측·창작 금지.
 - context_background는 연설자가 다루지 않았더라도 분석가가 객관적 사실로 보충 가능.
-
-[6렌즈 심층 분석 규칙 (six_lens_analysis)]
-- 모든 성구에 대해 6가지 렌즈(표현·필자·배경·감정·연대·여호와)로 깊이 분석하되, 각 렌즈는 해당 성구에 실제로 적용 가능하고 통찰을 더하는 경우에만 채우고, 억지로 끼워 맞출 내용이 없으면 반드시 null로 둘 것.
-- 모든 렌즈를 채우는 것이 목표가 아니라, 성구 성격에 맞는 렌즈만 의미 있게 채우는 것이 목표. 예: 교훈적 잠언 구절은 author/emotion/timeline이 null일 수 있고, 서사적 역사 기록은 6렌즈가 모두 풍부하게 채워질 수 있음.
-- context_background, translation_notes, deep_meditation 필드와 six_lens_analysis 사이에 동일 문장·내용 반복 금지. 서로 다른 각도의 통찰을 담을 것.
-- 연사가 실제로 언급하지 않은 배경지식이라도, 성서적·역사적 사실에 근거한 것이라면 분석가가 보충 가능 (추측·창작은 금지하고 검증 가능한 사실 위주로 작성).
 
 [전달기법 분석 규칙 (delivery_technique)]
 - process_applied의 boolean 체크와는 별개로, 낭독→설명→예화→적용 4단계가 실제로 얼마나 매끄럽고 설득력 있게 연결되었는지를 질적으로 평가.
@@ -138,7 +128,7 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
 
 [성구 정규화 규칙]
 - search_tags.scriptures: 연설에 언급된 모든 성구를 낱개로 정규화하여 포함
-- talk_flow 안의 scriptures[].reference도 동일하게 낱개로 정규화
+- 단, talk_flow 안의 scriptures[].reference는 연속된 구절 범위를 하나로 묶어 적을 것 (예: "창세기 3:1-5", "잠언 2:1, 2, 10"). 같은 범위를 절마다 따로 분석하지 말 것.
 - "창세기 3장 1절부터 5절" → ["창세기 3:1", "창세기 3:2", ..., "창세기 3:5"]
 - "잠언 2장 1,2,10절" → ["잠언 2:1", "잠언 2:2", "잠언 2:10"]
 - 범위나 목록 성구는 반드시 낱개 항목으로 전개할 것
@@ -180,10 +170,46 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
 4. ai_coaching_summary가 talk_flow의 내용을 반복하지 않는지 확인하라.
 5. illustration_detail과 insight_point 사이, 그리고 요점의 illustrations와 성구의 illustration_detail 사이에 내용 중복이 없는지 확인하라.
 6. translation_notes와 deep_meditation이 실제 연설 내용에 근거한 것인지 확인하라. 추측이면 null로 수정.
-7. search_tags.scriptures의 모든 성구가 talk_flow 안에 빠짐없이, 중복 없이 들어갔는지, 요점 순서가 실제 연설 순서와 같은지 확인하라.
-8. six_lens_analysis의 각 렌즈가 context_background/translation_notes/deep_meditation과 내용이 중복되지 않는지 확인하고, 적용 불가능한 렌즈는 null로 비워졌는지 확인하라.
-9. delivery_technique이 process_applied의 boolean을 단순 재진술하지 않고 질적 평가를 담고 있는지 확인하라.
-10. 검증 완료 후, 오직 완성된 JSON만 출력하라."""
+7. search_tags.scriptures의 모든 성구가 talk_flow 안에 빠짐없이(범위는 묶어서), 중복 없이 들어갔는지, 요점 순서가 실제 연설 순서와 같은지 확인하라.
+8. delivery_technique이 process_applied의 boolean을 단순 재진술하지 않고 질적 평가를 담고 있는지 확인하라.
+9. 검증 완료 후, 오직 완성된 JSON만 출력하라."""
+
+LENS_SYSTEM = """당신은 여호와의 증인 공개 연설에 쓰인 성구를 깊이 연구하는 성서 분석가입니다.
+주어진 성구 하나를 6가지 렌즈로 분석해 아래 JSON 형식으로만 응답하세요.
+모든 값은 한국어로 작성하고, JSON 외의 문장·마크다운 코드블록은 넣지 마세요.
+
+[출력 JSON 스키마]
+{
+  "expression": "[렌즈1-표현] 출판물의 해석 방향, 상호 참조 성구, 히브리어/그리스어 원어 뉘앙스, 신세계역 외 번역본 비교, 문맥상 역할, 평행 성구 비교 중 이 성구에 실제로 의미 있게 적용되는 통찰만 종합 서술. translation_notes(연설자가 직접 언급한 번역 비교)와 중복 금지 — 이 필드는 분석가가 보충하는 원어·문맥·평행성구 통찰. 의미 있는 내용이 없으면 null. (string)",
+  "author": "[렌즈2-필자] 이 성구를 기록한 필자가 누구이며 어떤 상황(포로기·박해·선교여정 등)에서, 언제, 어디서, 무엇을, 왜 기록했는지와 그 기록 목적(경고/위로/교정/역사보존/예언성취)이 본문 선택에 어떻게 반영되었는지. 의미 있는 내용이 없으면 null. (string)",
+  "context": "[렌즈3-배경] 사회·경제(계층·직업·경제상황), 도덕·종교(주변민족 관습·우상숭배·율법환경), 상황·장면(날씨·시간대·공간), 인물의 직업·출신배경 중 이 성구에 실제로 적용되는 것만 서술. context_background 필드와 중복 금지 — 이 필드는 더 구체적인 사회·종교·장면적 배경. 의미 있는 내용이 없으면 null. (string)",
+  "emotion": "[렌즈4-감정] 본문 속 인물이 느낀 감정(두려움·의심·기쁨·분노·슬픔 등)과 그 심화·전환 과정, 현대 독자의 공감 포인트, 상황과 감정의 상호작용. 인물의 감정선이 뚜렷하지 않은 교훈적 성구라면 null. (string)",
+  "timeline": "[렌즈5-연대] 선행 사건과의 인과관계, 여호와의 시간표(카이로스)와 인간 기대 시점의 차이, 헬라어 시제가 단회/반복을 시사하는지(해당시), 이 사건의 단기·장기 연쇄효과, 예언-성취 간격, 동시대 성서인물 비교. 연대적 요소가 없는 성구라면 null. (string)",
+  "jehovah": "[렌즈6-여호와] 여호와께서 이 내용을 성경에 포함하신 이유, 사건 처리 방식(직접개입/침묵/위임), 두드러지는 속성(사랑·공의·지혜·인내·능력), 제시되는 도덕적·영적 표준, 시대를 초월하는 핵심 원칙, 사용된 비유·상징의 심층 의미. 의미 있는 내용이 없으면 null. (string)"
+}
+
+[6렌즈 심층 분석 규칙 (six_lens_analysis)]
+- 모든 성구에 대해 6가지 렌즈(표현·필자·배경·감정·연대·여호와)로 깊이 분석하되, 각 렌즈는 해당 성구에 실제로 적용 가능하고 통찰을 더하는 경우에만 채우고, 억지로 끼워 맞출 내용이 없으면 반드시 null로 둘 것.
+- 모든 렌즈를 채우는 것이 목표가 아니라, 성구 성격에 맞는 렌즈만 의미 있게 채우는 것이 목표. 예: 교훈적 잠언 구절은 author/emotion/timeline이 null일 수 있고, 서사적 역사 기록은 6렌즈가 모두 풍부하게 채워질 수 있음.
+- 함께 주어지는 context_background, translation_notes, deep_meditation과 동일 문장·내용 반복 금지. 서로 다른 각도의 통찰을 담을 것.
+- 연사가 실제로 언급하지 않은 배경지식이라도, 성서적·역사적 사실에 근거한 것이라면 분석가가 보충 가능 (추측·창작은 금지하고 검증 가능한 사실 위주로 작성).
+
+[여호와의 증인 전용 용어]
+- 하나님 대신 여호와 또는 하느님, 예수님 대신 예수 또는 예수 그리스도, 성도·신자 대신 그리스도인, 예배 대신 집회를 쓸 것."""
+
+LENS_USER_TEMPLATE = """[성구]
+{reference}
+
+[연설에서 이 성구를 사용한 요점]
+{point}
+
+[이미 작성된 분석 — 아래 내용과 중복되지 않게 할 것]
+- 배경(context_background): {context_background}
+- 번역판 활용(translation_notes): {translation_notes}
+- 깊은 묵상점(deep_meditation): {deep_meditation}
+- 연설자의 해설: {explanation}
+
+위 성구를 6렌즈로 분석해 JSON으로 출력하세요."""
 
 ANALYSIS_USER_TEMPLATE = """[강연 골자 (Outline)]
 {outline}
@@ -238,12 +264,16 @@ def analyze_speech(
     outline_text: str,
     *,
     anthropic_api_key: str,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     연설 텍스트와 골자를 Claude로 비교 분석한다.
+    1단계: 강연 흐름 + 기본 성구 분석을 한 번에 요청
+    2단계: 성구별 6렌즈 심층 분석을 동시에(병렬) 요청해 결과에 합친다
     outline_text가 비어 있으면 outline_adherence 없이 분석한다.
-    반환: 분석 결과 dict (JSON 스키마 참조)
+    progress: 진행 상황 문구를 받을 함수 (화면 표시용, 선택)
     """
+    report = progress or (lambda _msg: None)
     client = anthropic.Anthropic(api_key=anthropic_api_key)
 
     has_outline = bool(outline_text and outline_text.strip())
@@ -259,19 +289,77 @@ def analyze_speech(
             speech=speech_text.strip(),
         )
 
-    with client.messages.stream(
+    # ── 1단계: 강연 흐름 분석 ────────────────────────────────────────────────
+    report("강연 흐름과 성구 기본 분석 중...")
+    raw = _call_claude(client, system, user_message, effort="medium", max_tokens=64000)
+    analysis = _parse_json_response(raw)
+
+    # ── 2단계: 성구별 6렌즈 병렬 분석 ───────────────────────────────────────
+    targets = [
+        (pt, s)
+        for sec in analysis.get("talk_flow") or []
+        for pt in sec.get("points") or []
+        for s in pt.get("scriptures") or []
+    ]
+    if targets:
+        report(f"성구 {len(targets)}개 6렌즈 심층 분석 중 (동시 진행)...")
+        done = 0
+        with ThreadPoolExecutor(max_workers=LENS_WORKERS) as pool:
+            futures = {
+                pool.submit(_analyze_lens, client, pt.get("point", ""), s): s
+                for pt, s in targets
+            }
+            for fut in as_completed(futures):
+                s = futures[fut]
+                try:
+                    s["six_lens_analysis"] = fut.result()
+                except Exception:
+                    # 렌즈 하나가 실패해도 전체 분석은 살린다
+                    s["six_lens_analysis"] = {}
+                done += 1
+                report(f"6렌즈 분석 {done}/{len(targets)} 완료")
+
+    return analysis
+
+
+# ── 내부 유틸 ───────────────────────────────────────────────────────────────
+
+
+def _call_claude(client, system: str, user_message: str, *, effort: str, max_tokens: int) -> str:
+    """Claude를 스트리밍으로 호출해 응답 텍스트를 돌려준다.
+    안전 필터로 거절되면 서버 쪽에서 다른 모델로 자동 재시도(fallbacks)한다."""
+    with client.beta.messages.stream(
         model=MODEL,
-        max_tokens=32000,
+        max_tokens=max_tokens,
         system=system,
+        output_config={"effort": effort},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
         messages=[{"role": "user", "content": user_message}],
     ) as stream:
         message = stream.get_final_message()
 
-    raw_output = message.content[0].text.strip()
-    return _parse_json_response(raw_output)
+    if message.stop_reason == "refusal":
+        raise RuntimeError("Claude가 이 요청의 분석을 거절했습니다. 잠시 후 다시 시도해 주세요.")
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError("분석 결과가 너무 길어 중간에 잘렸습니다. 다시 시도해 주세요.")
+
+    # 응답 앞에 thinking 블록이 올 수 있으므로 text 블록만 모은다
+    return "".join(b.text for b in message.content if b.type == "text").strip()
 
 
-# ── 내부 유틸 ───────────────────────────────────────────────────────────────
+def _analyze_lens(client, point: str, s: dict) -> dict:
+    """성구 하나의 6렌즈 심층 분석."""
+    user_message = LENS_USER_TEMPLATE.format(
+        reference=s.get("reference", ""),
+        point=point or "-",
+        context_background=s.get("context_background") or "-",
+        translation_notes=s.get("translation_notes") or "-",
+        deep_meditation=s.get("deep_meditation") or "-",
+        explanation=s.get("detailed_explanation") or "-",
+    )
+    raw = _call_claude(client, LENS_SYSTEM, user_message, effort="low", max_tokens=16000)
+    return _parse_json_response(raw)
 
 
 def _parse_json_response(text: str) -> dict:

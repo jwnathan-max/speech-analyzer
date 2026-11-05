@@ -15,6 +15,7 @@ import base64
 import io
 import os
 import re
+import tempfile
 from pathlib import Path
 
 import anthropic
@@ -32,7 +33,7 @@ from notion_db import create_talk
 from transcriber import transcribe
 
 # 배포 확인용 버전 — 코드를 바꿔 배포할 때마다 올린다 (화면 상단에 표시됨)
-APP_VERSION = "v2.2 (2026-11-05) · 음성 변환 Gemini로 전환"
+APP_VERSION = "v2.3 (2026-11-05) · 분석 속도 개선 + 골자 파일 직접 올리기"
 
 # ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
@@ -125,6 +126,24 @@ def load_outline(outline_number: str) -> str:
         f"`outlines_pdf/S-34_KO_{outline_number}.pdf` 또는 `.docx` 파일을 찾을 수 없습니다. "
         "해당 파일을 outlines_pdf/ 폴더에 추가해 주세요."
     )
+
+
+def load_uploaded_outline(uploaded_file) -> str:
+    """화면에서 직접 올린 골자 파일(PDF/Word)에서 텍스트를 뽑는다."""
+    suffix = Path(uploaded_file.name).suffix.lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.getvalue())
+        tmp_path = Path(tmp.name)
+    try:
+        if suffix == ".docx":
+            text = _extract_docx_text(tmp_path)
+        else:
+            text = _extract_pdf_text(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    if not text.strip():
+        raise ValueError("올린 골자 파일에서 글자를 읽지 못했습니다. 다른 파일로 시도해 주세요.")
+    return text
 
 
 def _extract_docx_text(path: Path) -> str:
@@ -434,6 +453,12 @@ with st.form("main_form"):
         placeholder="예: 001",
         help="`outlines_pdf/S-34_KO_{번호}.pdf` 파일을 자동으로 불러옵니다.",
     )
+    outline_file = st.file_uploader(
+        "②-1 골자 파일 직접 올리기 (선택)",
+        type=["pdf", "docx"],
+        help="저장된 골자가 없는 강연이면 골자 PDF(또는 Word)를 여기에 올려 주세요. "
+             "올린 파일이 골자 번호보다 우선 사용됩니다.",
+    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -479,25 +504,37 @@ if submitted:
             pipeline_error = f"음성 변환 실패: {exc}"
             status.update(label="❌ 음성 변환 실패", state="error")
 
-        # Step 2: 골자 PDF 로드 (골자 번호가 있을 때만)
-        if not pipeline_error and num_clean:
-            st.write("📄 골자 PDF 불러오는 중...")
+        # Step 2: 골자 로드 (올린 파일 우선, 없으면 골자 번호로 저장된 파일)
+        if not pipeline_error and (outline_file or num_clean):
+            st.write("📄 골자 불러오는 중...")
             try:
-                outline_text = load_outline(num_clean)
+                if outline_file:
+                    outline_text = load_uploaded_outline(outline_file)
+                else:
+                    outline_text = load_outline(num_clean)
                 st.write("✅ 골자 불러오기 완료")
+            except FileNotFoundError as exc:
+                pipeline_error = (
+                    f"{exc}\n\n💡 저장된 골자가 없는 강연이면 "
+                    "'②-1 골자 파일 직접 올리기'에 골자 PDF를 올려 주세요."
+                )
+                status.update(label="❌ 골자 로드 실패", state="error")
             except Exception as exc:
-                pipeline_error = str(exc)
+                pipeline_error = f"골자 불러오기 실패: {exc}"
                 status.update(label="❌ 골자 로드 실패", state="error")
 
         # Step 3: AI 분석
         if not pipeline_error:
-            st.write("🤖 Claude AI 심층 분석 중... (30~90초 소요)")
+            st.write("🤖 Claude AI 심층 분석 중... (보통 3~5분 소요)")
+            progress_line = st.empty()
             try:
                 analysis = analyze_speech(
                     speech_text,
                     outline_text,
                     anthropic_api_key=ANTHROPIC_KEY,
+                    progress=lambda msg: progress_line.write(f"⏳ {msg}"),
                 )
+                progress_line.empty()
                 st.write("✅ AI 분석 완료")
             except Exception as exc:
                 pipeline_error = f"AI 분석 실패: {exc}"
