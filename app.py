@@ -5,7 +5,7 @@ app.py
 배포 전 준비 사항:
   1. .streamlit/secrets.toml 에 아래 키 추가:
        ANTHROPIC_API_KEY = "sk-ant-..."
-       OPENAI_API_KEY    = "sk-proj-..."
+       GEMINI_API_KEY    = "AQ...."   (음성 → 텍스트)
        NOTION_TOKEN      = "ntn_..."
        NOTION_TALKS_DB_ID = "..."
   2. outlines_pdf/ 폴더에 S-34_KO_{번호}.pdf 파일 저장.
@@ -15,7 +15,6 @@ import base64
 import io
 import os
 import re
-import tempfile
 from pathlib import Path
 
 import anthropic
@@ -24,16 +23,16 @@ import pypdfium2 as pdfium
 import streamlit as st
 from docx import Document
 from dotenv import load_dotenv
-from openai import OpenAI
 
 # 로컬 개발 환경: .env 파일 자동 로드
 load_dotenv()
 
 from analyzer import analyze_speech
 from notion_db import create_talk
+from transcriber import transcribe
 
 # 배포 확인용 버전 — 코드를 바꿔 배포할 때마다 올린다 (화면 상단에 표시됨)
-APP_VERSION = "v2.1 (2026-11-05) · 강연 흐름 분석 + 버전 표시"
+APP_VERSION = "v2.2 (2026-11-05) · 음성 변환 Gemini로 전환"
 
 # ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
@@ -97,39 +96,19 @@ def _secret(key: str, default: str = "") -> str:
 
 
 ANTHROPIC_KEY = _secret("ANTHROPIC_API_KEY")
-OPENAI_KEY    = _secret("OPENAI_API_KEY")
+GEMINI_KEY    = _secret("GEMINI_API_KEY")
 NOTION_TOKEN  = _secret("NOTION_TOKEN")
 NOTION_DB_ID  = _secret("NOTION_TALKS_DB_ID")
 
 OUTLINE_DIR   = Path("outlines_pdf")
 
-# ── 오디오 전사 (OpenAI Whisper) ─────────────────────────────────────────────
-
-_WHISPER_LIMIT = 25 * 1024 * 1024  # 25 MB
+# ── 오디오 전사 (Gemini) ──────────────────────────────────────────────────────
 
 
 def transcribe_audio(uploaded_file) -> str:
-    if uploaded_file.size > _WHISPER_LIMIT:
-        raise ValueError(
-            f"파일이 너무 큽니다 ({uploaded_file.size / 1024 / 1024:.1f} MB). "
-            "Whisper API 최대 허용 크기: 25 MB."
-        )
     suffix = Path(uploaded_file.name).suffix.lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
-    try:
-        client = OpenAI(api_key=OPENAI_KEY)
-        with open(tmp_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ko",
-                response_format="text",
-            )
-        return _clean_text(str(result))
-    finally:
-        os.unlink(tmp_path)
+    text = transcribe(uploaded_file.getvalue(), suffix, api_key=GEMINI_KEY)
+    return _clean_text(text)
 
 
 # ── 골자 PDF 로드 ─────────────────────────────────────────────────────────────
@@ -447,7 +426,7 @@ with st.form("main_form"):
     audio_file = st.file_uploader(
         "① 음성 파일 업로드",
         type=["mp3", "m4a", "wav", "ogg", "flac", "webm"],
-        help="OpenAI Whisper로 자동 전사합니다. 최대 25 MB.",
+        help="Gemini로 자동 전사합니다. 최대 200 MB.",
     )
 
     outline_number = st.text_input(

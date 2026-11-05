@@ -2,7 +2,7 @@
 extractor.py
 연설 파일(오디오/PDF/TXT)에서 텍스트를 추출하고 정제하는 모듈.
 
-- 오디오 (mp3, m4a, wav, ogg, flac): OpenAI Whisper API → STT
+- 오디오 (mp3, m4a, wav, ogg, flac, webm): Gemini → STT (transcriber.py)
 - PDF (일반): pdfplumber → 텍스트 정제
 - PDF (JW 커스텀폰트): pypdfium2로 이미지 렌더링 → Claude Vision으로 OCR
 - TXT: 직접 읽기
@@ -23,7 +23,8 @@ import anthropic
 import pdfplumber
 import pypdfium2 as pdfium
 from docx import Document
-from openai import OpenAI
+
+from transcriber import transcribe
 
 # 지원 파일 확장자
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".flac", ".webm"}
@@ -31,8 +32,6 @@ PDF_EXTENSIONS = {".pdf"}
 DOCX_EXTENSIONS = {".docx"}
 TEXT_EXTENSIONS = {".txt"}
 
-# Whisper API 파일 크기 제한 (25MB)
-WHISPER_SIZE_LIMIT = 25 * 1024 * 1024
 
 
 # ── Public API ─────────────────────────────────────────────────────────────
@@ -84,25 +83,11 @@ def list_jw_outlines(pdf_path: str) -> dict[int, int]:
 
 
 def _extract_from_audio(path: Path) -> str:
-    """OpenAI Whisper API를 사용해 오디오를 텍스트로 변환한다."""
-    file_size = path.stat().st_size
-    if file_size > WHISPER_SIZE_LIMIT:
-        raise ValueError(
-            f"오디오 파일이 너무 큽니다 ({file_size / 1024 / 1024:.1f}MB). "
-            f"Whisper API 제한: 25MB 이하."
-        )
-
-    client = OpenAI()
-
-    with open(path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            language="ko",
-            response_format="text",
-        )
-
-    return _clean_text(str(transcript))
+    """Gemini로 오디오를 텍스트로 변환한다."""
+    text = transcribe(
+        path.read_bytes(), path.suffix, api_key=os.environ.get("GEMINI_API_KEY", "")
+    )
+    return _clean_text(text)
 
 
 # ── PDF ────────────────────────────────────────────────────────────────────
