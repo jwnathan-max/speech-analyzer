@@ -12,10 +12,12 @@ app.py
 """
 
 import base64
+import difflib
 import io
 import os
 import re
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import anthropic
@@ -33,7 +35,7 @@ from notion_db import create_talk
 from transcriber import transcribe
 
 # 배포 확인용 버전 — 코드를 바꿔 배포할 때마다 올린다 (화면 상단에 표시됨)
-APP_VERSION = "v2.3 (2026-11-05) · 분석 속도 개선 + 골자 파일 직접 올리기"
+APP_VERSION = "v2.4 (2026-11-05) · 파일 이름으로 강연 정보 자동 입력 + 주제 확인"
 
 # ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
@@ -114,36 +116,121 @@ def transcribe_audio(uploaded_file) -> str:
 
 # ── 골자 PDF 로드 ─────────────────────────────────────────────────────────────
 
-def load_outline(outline_number: str) -> str:
-    """로컬 outlines_pdf/ 폴더에서 골자 파일(PDF 또는 DOCX)을 읽어 텍스트로 반환한다."""
+def load_outline(outline_number: str) -> tuple[str, str]:
+    """로컬 outlines_pdf/ 폴더에서 골자 파일(PDF 또는 DOCX)을 읽는다.
+    반환: (골자 본문 텍스트, 골자 제목)"""
     pdf_path = OUTLINE_DIR / f"S-34_KO_{outline_number}.pdf"
     docx_path = OUTLINE_DIR / f"S-34_KO_{outline_number}.docx"
     if pdf_path.exists():
-        return _extract_pdf_text(pdf_path)
+        return _read_outline_file(pdf_path)
     if docx_path.exists():
-        return _extract_docx_text(docx_path)
+        return _read_outline_file(docx_path)
     raise FileNotFoundError(
         f"`outlines_pdf/S-34_KO_{outline_number}.pdf` 또는 `.docx` 파일을 찾을 수 없습니다. "
         "해당 파일을 outlines_pdf/ 폴더에 추가해 주세요."
     )
 
 
-def load_uploaded_outline(uploaded_file) -> str:
-    """화면에서 직접 올린 골자 파일(PDF/Word)에서 텍스트를 뽑는다."""
+def load_uploaded_outline(uploaded_file) -> tuple[str, str]:
+    """화면에서 직접 올린 골자 파일(PDF/Word)을 읽는다. 반환: (본문, 제목)"""
     suffix = Path(uploaded_file.name).suffix.lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getvalue())
         tmp_path = Path(tmp.name)
     try:
-        if suffix == ".docx":
-            text = _extract_docx_text(tmp_path)
-        else:
-            text = _extract_pdf_text(tmp_path)
+        text, title = _read_outline_file(tmp_path)
     finally:
         tmp_path.unlink(missing_ok=True)
     if not text.strip():
         raise ValueError("올린 골자 파일에서 글자를 읽지 못했습니다. 다른 파일로 시도해 주세요.")
-    return text
+    return text, title
+
+
+def _read_outline_file(path: Path) -> tuple[str, str]:
+    if path.suffix.lower() == ".docx":
+        text = _extract_docx_text(path)
+        return text, _clean_outline_title(text.splitlines()[0] if text else "")
+    text = _extract_pdf_text(path)
+    return text, _outline_title_from_pdf(path, text)
+
+
+def _outline_title_from_pdf(path: Path, outline_text: str) -> str:
+    """골자 제목을 찾는다. 본문 추출은 페이지 위쪽을 잘라내므로 첫 페이지 전체에서 따로 읽는다.
+    글자가 깨진 PDF(이미지로 읽은 경우)는 읽어 낸 본문의 첫 줄을 쓴다."""
+    try:
+        with pdfplumber.open(str(path)) as pdf:
+            first = pdf.pages[0].extract_text() or ""
+        if first.strip() and not _is_garbled(first):
+            return _clean_outline_title(first.strip().splitlines()[0])
+    except Exception:
+        pass
+    for line in outline_text.splitlines():
+        if line.strip():
+            return _clean_outline_title(line)
+    return ""
+
+
+def _clean_outline_title(line: str) -> str:
+    line = re.sub(r"[*#]", "", line).strip()
+    return re.sub(r"^제\s*\d+\s*번\s*", "", line).strip()
+
+
+# ── 파일 이름에서 강연 정보 읽기 ─────────────────────────────────────────────
+
+# 예) 공개 강연_ (166) 진정한 믿음이란 무엇이며 어떻게 나타낼 수 있는가_ - 김정일 2026. 10. 3.mp3
+_KO_NAME = re.compile(
+    r"\((\d{1,3})\)\s*(.+?)\s+[-–—]\s+(.+?)\s+(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\.?\s*$"
+)
+# 예) Public Talks_ (115) Protect Yourself ... - Kenneth Varni 1_17_2026.mp3
+_EN_NAME = re.compile(
+    r"\((\d{1,3})\)\s*(.+?)\s+[-–—]\s+(.+?)\s+(\d{1,2})_(\d{1,2})_(\d{4})\s*$"
+)
+
+
+def parse_talk_filename(filename: str) -> dict | None:
+    """정해진 형식의 파일 이름에서 골자 번호·제목·연사·날짜를 읽는다. 형식이 아니면 None."""
+    stem = Path(filename).stem
+    m = _KO_NAME.search(stem)
+    if m:
+        num, title, speaker, y, mo, d = m.groups()
+    else:
+        m = _EN_NAME.search(stem)
+        if not m:
+            return None
+        num, title, speaker, mo, d, y = m.groups()
+    try:
+        talk_date = date(int(y), int(mo), int(d))
+    except ValueError:
+        talk_date = None
+    # 파일 이름에 못 쓰는 '?'가 '_'로 바뀌어 있으므로 되돌린다
+    title = re.sub(r"_\s*$", "?", title.strip()).replace("_ ", "? ")
+    return {
+        "number": num.zfill(3),
+        "title": title,
+        "speaker": speaker.strip(),
+        "date": talk_date,
+    }
+
+
+def check_title_match(file_title: str, outline_title: str) -> tuple[str, str]:
+    """파일 이름의 주제와 골자 제목을 비교한다. 반환: (상태, 안내 문구)
+    상태: match / mismatch / unknown"""
+    if not file_title or not outline_title:
+        return "unknown", "골자 제목을 확인하지 못해 주제 비교를 건너뛰었습니다."
+    if not re.search(r"[가-힣]", file_title):
+        return "unknown", (
+            f"파일 제목이 한국어가 아니어서 자동 비교하지 않았습니다. "
+            f"골자 제목: 「{outline_title}」 — 같은 강연인지 확인해 주세요."
+        )
+    norm = lambda s: re.sub(r"[^0-9A-Za-z가-힣]", "", s)
+    a, b = norm(file_title), norm(outline_title)
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    if ratio >= 0.8 or (a and b and (a in b or b in a)):
+        return "match", f"주제가 골자와 일치합니다: 「{outline_title}」"
+    return "mismatch", (
+        f"파일 제목 「{file_title}」과 골자 제목 「{outline_title}」이 다릅니다. "
+        "골자 번호가 맞는지 확인해 주세요."
+    )
 
 
 def _extract_docx_text(path: Path) -> str:
@@ -439,19 +526,41 @@ st.divider()
 
 # ── 입력 폼 ───────────────────────────────────────────────────────────────────
 
-with st.form("main_form"):
-    st.subheader("📋 강연 정보 입력")
+st.subheader("📋 강연 정보 입력")
 
-    audio_file = st.file_uploader(
-        "① 음성 파일 업로드",
-        type=["mp3", "m4a", "wav", "ogg", "flac", "webm"],
-        help="Gemini로 자동 전사합니다. 최대 200 MB.",
+# 음성 파일은 폼 밖에 둔다 — 올리자마자 파일 이름을 읽어 아래 칸을 자동으로 채우기 위해
+audio_file = st.file_uploader(
+    "① 음성 파일 업로드",
+    type=["mp3", "m4a", "wav", "ogg", "flac", "webm"],
+    help="Gemini로 자동 전사합니다. 최대 200 MB.\n\n"
+         "파일 이름이 `공개 강연_ (166) 제목 - 연사 2026. 10. 3.mp3` 형식이면 "
+         "골자 번호·연사·날짜를 자동으로 채웁니다.",
+)
+
+file_info = parse_talk_filename(audio_file.name) if audio_file else None
+if audio_file and st.session_state.get("_autofill_for") != audio_file.name:
+    # 새 파일을 올렸을 때 한 번만 채운다 (이후 직접 고친 값은 유지)
+    st.session_state["_autofill_for"] = audio_file.name
+    if file_info:
+        st.session_state["outline_number"] = file_info["number"]
+        st.session_state["speaker"] = file_info["speaker"]
+        st.session_state["talk_date"] = file_info["date"]
+
+if file_info:
+    date_txt = file_info["date"].strftime("%Y-%m-%d") if file_info["date"] else "날짜 없음"
+    st.caption(
+        f"🪄 파일 이름에서 자동 입력: 골자 {file_info['number']} · "
+        f"{file_info['speaker'] or '연사 없음'} · {date_txt} — 아래에서 고칠 수 있습니다."
     )
+elif audio_file:
+    st.caption("ℹ️ 파일 이름이 정해진 형식이 아니어서 자동 입력하지 않았습니다. 필요하면 직접 입력하거나 비워 두세요.")
 
+with st.form("main_form"):
     outline_number = st.text_input(
         "② 골자 번호",
         placeholder="예: 001",
         help="`outlines_pdf/S-34_KO_{번호}.pdf` 파일을 자동으로 불러옵니다.",
+        key="outline_number",
     )
     outline_file = st.file_uploader(
         "②-1 골자 파일 직접 올리기 (선택)",
@@ -465,12 +574,14 @@ with st.form("main_form"):
         speaker = st.text_input(
             "③ 연사 이름",
             placeholder="홍길동 (선택 사항)",
+            key="speaker",
         )
     with col2:
         talk_date = st.date_input(
             "④ 연설 날짜",
-            value=None,
+            value=st.session_state.get("talk_date"),
             help="선택 사항 — 비워두면 노션에 날짜가 저장되지 않습니다.",
+            key="talk_date",
         )
 
     submitted = st.form_submit_button(
@@ -492,6 +603,7 @@ if submitted:
     notion_url = ""
     pipeline_error = ""  # status 밖에서 표시할 에러 메시지
     outline_text = ""
+    title_warning = ""  # 주제-골자 불일치 시 결과 위에 다시 보여줄 문구
 
     with st.status("📡 분석을 진행하고 있습니다...", expanded=True) as status:
 
@@ -509,10 +621,21 @@ if submitted:
             st.write("📄 골자 불러오는 중...")
             try:
                 if outline_file:
-                    outline_text = load_uploaded_outline(outline_file)
+                    outline_text, outline_title = load_uploaded_outline(outline_file)
                 else:
-                    outline_text = load_outline(num_clean)
+                    outline_text, outline_title = load_outline(num_clean)
                 st.write("✅ 골자 불러오기 완료")
+
+                # 파일 이름의 주제와 골자 제목 비교 (다르면 경고만 하고 분석은 계속)
+                if file_info:
+                    title_state, title_msg = check_title_match(file_info["title"], outline_title)
+                    if title_state == "match":
+                        st.write(f"✅ {title_msg}")
+                    elif title_state == "mismatch":
+                        title_warning = title_msg
+                        st.warning(f"⚠️ {title_msg}")
+                    else:
+                        st.write(f"ℹ️ {title_msg}")
             except FileNotFoundError as exc:
                 pipeline_error = (
                     f"{exc}\n\n💡 저장된 골자가 없는 강연이면 "
@@ -568,4 +691,6 @@ if submitted:
         st.error(f"❌ {pipeline_error}")
         st.stop()
 
+    if title_warning:
+        st.warning(f"⚠️ {title_warning}")
     render_results(analysis, notion_url)
