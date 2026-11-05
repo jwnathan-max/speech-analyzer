@@ -241,6 +241,117 @@ def _clean_text(text: str) -> str:
 
 # ── 결과 화면 렌더링 ──────────────────────────────────────────────────────────
 
+_LENS_LABELS = {
+    "expression": "🔍 표현",
+    "author": "🔍 필자",
+    "context": "🔍 배경(심층)",
+    "emotion": "🔍 감정",
+    "timeline": "🔍 연대",
+    "jehovah": "🔍 여호와",
+}
+
+_ILLUS_ICONS = {"예": "🧩", "비유": "💡", "경험담": "🗣️", "질문": "❓", "시각자료": "🖼️"}
+
+
+def _render_point(pt: dict) -> None:
+    """요점 하나를 카드로 표시한다: 요점 → 설명 → 예·비유 → 성구 → 연결."""
+    level = pt.get("point_level", "")
+    is_sub = level == "부가요점"
+    with st.container(border=True):
+        prefix = "↳ " if is_sub else "● "
+        level_tag = f" <span class='tag-chip'>{level}</span>" if level else ""
+        st.markdown(
+            f"**{prefix}{pt.get('point', '')}**{level_tag}",
+            unsafe_allow_html=True,
+        )
+        if pt.get("explanation"):
+            st.markdown(f"**설명:** {pt['explanation']}")
+
+        for il in pt.get("illustrations") or []:
+            kind = il.get("type", "예")
+            line = f"{_ILLUS_ICONS.get(kind, '💡')} **{kind}:** {il.get('content', '')}"
+            if il.get("effect"):
+                line += f"  \n↳ *효과:* {il['effect']}"
+            st.markdown(line)
+
+        for s in pt.get("scriptures") or []:
+            _render_scripture(s)
+
+        if pt.get("transition"):
+            st.markdown(f"➡️ **연결:** {pt['transition']}")
+
+
+def _render_scripture(s: dict) -> None:
+    """성구 하나를 접이식 칸으로 표시한다."""
+    ref          = s.get("reference", "")
+    is_mandatory = s.get("is_mandatory", False)
+    is_fresh     = s.get("is_fresh_perspective", False)
+    context_bg   = s.get("context_background", "")
+    translation  = s.get("translation_notes")
+    meditation   = s.get("deep_meditation")
+    explanation  = s.get("detailed_explanation", "")
+    illus_detail = s.get("illustration_detail")
+    insight      = s.get("insight_point")
+    application  = s.get("application", "")
+    process      = s.get("process_applied") or {}
+    delivery     = s.get("delivery_technique")
+    six_lens     = s.get("six_lens_analysis") or {}
+
+    mandatory_badge = " ★낭독" if is_mandatory else ""
+    fresh_badge = "🌟 " if is_fresh else ""
+    label = f"{fresh_badge}📖 {ref}{mandatory_badge}"
+
+    with st.expander(label, expanded=False):
+        if process:
+            def _mark(v): return "✅" if v else "▫️"
+            st.markdown(
+                f"**낭설예적:** "
+                f"{_mark(process.get('read_aloud'))} 낭독  "
+                f"{_mark(process.get('explained'))} 설명  "
+                f"{_mark(process.get('example_used'))} 예  "
+                f"{_mark(process.get('application_made'))} 적용"
+            )
+        if delivery:
+            st.markdown(f"**전달기법 평가:** {delivery}")
+
+        if context_bg:
+            st.markdown(f"**배경:** {context_bg}")
+        if translation:
+            st.markdown(f"**번역판 활용:** {translation}")
+        if meditation:
+            st.info(f"🪞 **깊은 묵상점**\n\n{meditation}")
+
+        if is_fresh:
+            parts: list[str] = []
+            if illus_detail:
+                parts.append(f"▸ 비유: {illus_detail}")
+            if insight:
+                parts.append(f"▸ 통찰: {insight}")
+            body = "<br>".join(parts)
+            if body:
+                st.markdown(
+                    f'<div class="fresh-callout">'
+                    f'🌟 <strong>독특한 통찰</strong><br>{body}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        elif illus_detail:
+            st.markdown(f"> 💡 **비유:** {illus_detail}")
+
+        if explanation:
+            st.markdown(f"**해설:** {explanation}")
+        if application:
+            st.markdown(f"✅ **적용:** {application}")
+
+        lens_items = [
+            (lbl, six_lens.get(key)) for key, lbl in _LENS_LABELS.items() if six_lens.get(key)
+        ]
+        if lens_items:
+            st.markdown("**🧩 6렌즈 심층 분석**")
+            for lbl, content in lens_items:
+                st.markdown(f"- **{lbl}:** {content}")
+
+
 def render_results(analysis: dict, notion_url: str = "") -> None:
     topic       = analysis.get("topic", "분석 결과")
     adherence   = analysis.get("outline_adherence", {})
@@ -250,8 +361,7 @@ def render_results(analysis: dict, notion_url: str = "") -> None:
     search_tags = analysis.get("search_tags", {})
     scriptures  = search_tags.get("scriptures", [])
     illus_tags  = search_tags.get("illustrations", [])
-    hierarchy   = analysis.get("outline_hierarchy_analysis") or {}
-    scripture_analysis = analysis.get("scripture_analysis") or []
+    talk_flow   = analysis.get("talk_flow") or []
 
     st.divider()
 
@@ -300,109 +410,20 @@ def render_results(analysis: dict, notion_url: str = "") -> None:
         if coaching.get("areas_for_improvement"):
             st.info(f"🌱 **개선 제안**\n\n{coaching['areas_for_improvement']}")
 
-    # ── 골자 계층 분석 (서론/본론/결론 리포트) ───────────────────────────────
-    intro_report = hierarchy.get("intro_report", "")
-    body_report = hierarchy.get("body_report", "")
-    conclusion_report = hierarchy.get("conclusion_report", "")
-    if intro_report or body_report or conclusion_report:
-        st.subheader("🧭 골자 계층 분석")
-        st.caption("각 요점이 예·비유·성구로 어떻게 강조되고, 요점들이 어떻게 유기적으로 연결되는지")
-        if intro_report:
-            st.markdown("**🔰 서론**")
-            st.markdown(intro_report)
-        if body_report:
-            st.markdown("**📖 본론**")
-            st.markdown(body_report)
-        if conclusion_report:
-            st.markdown("**🏁 결론**")
-            st.markdown(conclusion_report)
+    # ── 강연 흐름 분석 (서론 → 본론 → 결론, 요점별 설명·예·성구) ────────────
+    if talk_flow:
+        st.subheader("🗺️ 강연 흐름 분석")
+        st.caption("요점마다 어떻게 설명하고, 어떤 예·비유·성구로 강조하며, 다음 요점으로 연결했는지")
 
-    # ── 성구 분석 ────────────────────────────────────────────────────────────
-    if scripture_analysis:
-        st.subheader("📖 성구 분석")
-        st.caption("낭설예적(낭독·설명·예·적용) · 배경 · 다른 번역판 · 깊은 묵상점")
+        section_icons = {"서론": "🔰", "본론": "📖", "결론": "🏁"}
+        for sec in talk_flow:
+            name = sec.get("section", "")
+            st.markdown(f"### {section_icons.get(name, '▪️')} {name}")
+            if sec.get("section_summary"):
+                st.caption(sec["section_summary"])
 
-        for i, s in enumerate(scripture_analysis, 1):
-            ref          = s.get("reference", "")
-            section      = s.get("belongs_to_section", "")
-            is_mandatory = s.get("is_mandatory", False)
-            is_fresh     = s.get("is_fresh_perspective", False)
-            context_bg   = s.get("context_background", "")
-            translation  = s.get("translation_notes")
-            meditation   = s.get("deep_meditation")
-            explanation  = s.get("detailed_explanation", "")
-            illus_detail = s.get("illustration_detail")
-            insight      = s.get("insight_point")
-            application  = s.get("application", "")
-            process      = s.get("process_applied") or {}
-            delivery     = s.get("delivery_technique")
-            six_lens     = s.get("six_lens_analysis") or {}
-
-            mandatory_badge = " ★낭독" if is_mandatory else ""
-            fresh_badge = "🌟 " if is_fresh else ""
-            section_label = f" — {section}" if section else ""
-            label = f"{fresh_badge}📖 {ref}{mandatory_badge}{section_label}"
-
-            with st.expander(label, expanded=False):
-                if process:
-                    def _mark(v): return "✅" if v else "▫️"
-                    st.markdown(
-                        f"**낭설예적:** "
-                        f"{_mark(process.get('read_aloud'))} 낭독  "
-                        f"{_mark(process.get('explained'))} 설명  "
-                        f"{_mark(process.get('example_used'))} 예  "
-                        f"{_mark(process.get('application_made'))} 적용"
-                    )
-                if delivery:
-                    st.markdown(f"**전달기법 평가:** {delivery}")
-
-                if context_bg:
-                    st.markdown(f"**배경:** {context_bg}")
-                if translation:
-                    st.markdown(f"**번역판 활용:** {translation}")
-                if meditation:
-                    st.info(f"🪞 **깊은 묵상점**\n\n{meditation}")
-
-                if is_fresh:
-                    parts: list[str] = []
-                    if illus_detail:
-                        parts.append(f"▸ 비유: {illus_detail}")
-                    if insight:
-                        parts.append(f"▸ 통찰: {insight}")
-                    body = "<br>".join(parts) if parts else (insight or illus_detail or "")
-                    if body:
-                        st.markdown(
-                            f'<div class="fresh-callout">'
-                            f'🌟 <strong>독특한 통찰</strong><br>{body}'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    if illus_detail:
-                        st.markdown(f"> 💡 **비유:** {illus_detail}")
-
-                if explanation:
-                    st.markdown(f"**해설:** {explanation}")
-                if application:
-                    st.markdown(f"✅ **적용:** {application}")
-
-                lens_labels = {
-                    "expression": "🔍 표현",
-                    "author": "🔍 필자",
-                    "context": "🔍 배경(심층)",
-                    "emotion": "🔍 감정",
-                    "timeline": "🔍 연대",
-                    "jehovah": "🔍 여호와",
-                }
-                lens_items = [
-                    (lens_labels[key], six_lens.get(key))
-                    for key in lens_labels
-                    if six_lens.get(key)
-                ]
-                if lens_items:
-                    st.markdown("**🧩 6렌즈 심층 분석**")
-                    for label, content in lens_items:
-                        st.markdown(f"- **{label}:** {content}")
+            for pt in sec.get("points") or []:
+                _render_point(pt)
 
     # ── 노션 링크 ─────────────────────────────────────────────────────────────
     if notion_url:

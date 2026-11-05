@@ -238,7 +238,12 @@ def _print_analysis_summary(analysis: dict, page_url: str) -> None:
     search_tags = analysis.get("search_tags", {})
     scriptures = search_tags.get("scriptures", [])
     illustrations = search_tags.get("illustrations", [])
-    scripture_analysis = analysis.get("scripture_analysis") or []
+    scripture_analysis = [
+        s
+        for sec in analysis.get("talk_flow") or []
+        for pt in sec.get("points") or []
+        for s in pt.get("scriptures") or []
+    ]
 
     summary = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
     summary.add_column(style="bold cyan", width=16, no_wrap=True)

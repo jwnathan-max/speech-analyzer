@@ -130,23 +130,45 @@ def create_talk(
             },
         })
 
-    # 첫 100개와 함께 페이지 생성
+    # 요청당 최상위 블록 100개, 하위 포함 전체 블록 1000개 제한이 있으므로 나눠서 전송
+    chunks = _chunk_blocks(all_blocks)
     page = notion.pages.create(
         parent={"database_id": db_id},
         properties=properties,
-        children=all_blocks[:100],
+        children=chunks[0] if chunks else [],
     )
     page_id = page["id"]
 
-    # 100개 초과 블록 분할 전송 (502 에러 방지)
-    for i in range(100, len(all_blocks), 100):
+    # 나머지 묶음 분할 전송 (502 에러 방지)
+    for chunk in chunks[1:]:
         time.sleep(1)
-        notion.blocks.children.append(
-            block_id=page_id,
-            children=all_blocks[i : i + 100],
-        )
+        notion.blocks.children.append(block_id=page_id, children=chunk)
 
     return page.get("url", "")
+
+
+def _count_blocks(block: dict) -> int:
+    """블록 하나와 그 하위 블록의 총 개수."""
+    inner = block.get(block.get("type", ""), {})
+    children = inner.get("children", []) if isinstance(inner, dict) else []
+    return 1 + sum(_count_blocks(c) for c in children)
+
+
+def _chunk_blocks(blocks: list, max_top: int = 100, max_total: int = 800) -> list:
+    """Notion 요청 제한에 맞춰 블록 목록을 여러 묶음으로 나눈다."""
+    chunks: list[list] = []
+    current: list = []
+    total = 0
+    for b in blocks:
+        n = _count_blocks(b)
+        if current and (len(current) >= max_top or total + n > max_total):
+            chunks.append(current)
+            current, total = [], 0
+        current.append(b)
+        total += n
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _upload_transcript_txt(notion_token: str, topic: str, text: str) -> str:
@@ -266,6 +288,36 @@ def _build_analysis_blocks(analysis: dict) -> list:
     def divider() -> dict:
         return {"object": "block", "type": "divider", "divider": {}}
 
+    def quote(text: str) -> dict:
+        return {
+            "object": "block", "type": "quote",
+            "quote": {"rich_text": [{"type": "text", "text": {"content": _t(text)}}]},
+        }
+
+    def bold_paragraph(text: str) -> dict:
+        return {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{
+                "type": "text", "text": {"content": _t(text)}, "annotations": {"bold": True},
+            }]},
+        }
+
+    def scripture_toggle(s: dict) -> dict:
+        """성구 하나를 토글 블록으로 만든다. 펼치면 상세 분석이 보인다."""
+        fresh = "🌟 " if s.get("is_fresh_perspective") else ""
+        mandatory = " ★낭독" if s.get("is_mandatory") else ""
+        return {
+            "object": "block", "type": "toggle",
+            "toggle": {
+                "rich_text": [{
+                    "type": "text",
+                    "text": {"content": _t(f"{fresh}📖 {s.get('reference', '')}{mandatory}")},
+                    "annotations": {"bold": True},
+                }],
+                "children": _scripture_children(s)[:100],
+            },
+        }
+
     # ── 골자 일치도 ───────────────────────────────────────────────────────────
     adherence = analysis.get("outline_adherence", {})
     score     = adherence.get("score", "-")
@@ -287,108 +339,154 @@ def _build_analysis_blocks(analysis: dict) -> list:
             blocks.append(paragraph_labeled("🌱 개선 제안", coaching["areas_for_improvement"]))
         blocks.append(divider())
 
-    # ── 골자 계층 분석 (서론/본론/결론 리포트) ───────────────────────────────
-    hierarchy = analysis.get("outline_hierarchy_analysis") or {}
-    intro_report = hierarchy.get("intro_report", "")
-    body_report = hierarchy.get("body_report", "")
-    conclusion_report = hierarchy.get("conclusion_report", "")
-    if intro_report or body_report or conclusion_report:
-        blocks.append(heading2("🧭 골자 계층 분석"))
-        blocks.append(paragraph("각 부분의 요점이 어떤 예·비유·성구로 강조되고, 요점들이 어떻게 유기적으로 연결되는지 분석합니다."))
-        if intro_report:
-            blocks.append(heading3("🔰 서론"))
-            blocks.append(paragraph(_t(intro_report)))
-        if body_report:
-            blocks.append(heading3("📖 본론"))
-            blocks.append(paragraph(_t(body_report)))
-        if conclusion_report:
-            blocks.append(heading3("🏁 결론"))
-            blocks.append(paragraph(_t(conclusion_report)))
+    # ── 강연 흐름 분석 (서론 → 본론 → 결론, 요점별 설명·예·성구) ────────────
+    talk_flow = analysis.get("talk_flow") or []
+    if talk_flow:
+        blocks.append(heading2("🗺️ 강연 흐름 분석"))
+        blocks.append(paragraph("요점마다 어떻게 설명하고, 어떤 예·비유·성구로 강조하며, 다음 요점으로 연결했는지 강연 순서대로 정리합니다. 성구는 토글을 펼쳐 상세 분석을 볼 수 있습니다."))
+
+        section_icons = {"서론": "🔰", "본론": "📖", "결론": "🏁"}
+        illus_icons = {"예": "🧩", "비유": "💡", "경험담": "🗣️", "질문": "❓", "시각자료": "🖼️"}
+
+        for sec in talk_flow:
+            name = sec.get("section", "")
+            blocks.append(heading3(f"{section_icons.get(name, '▪️')} {name}"))
+            if sec.get("section_summary"):
+                blocks.append(quote(sec["section_summary"]))
+
+            for pt in sec.get("points") or []:
+                level = pt.get("point_level", "")
+                prefix = "↳ " if level == "부가요점" else "● "
+                level_suffix = f"  [{level}]" if level else ""
+                blocks.append(bold_paragraph(f"{prefix}{pt.get('point', '')}{level_suffix}"))
+
+                if pt.get("explanation"):
+                    blocks.append(paragraph_labeled("설명", pt["explanation"]))
+
+                for il in pt.get("illustrations") or []:
+                    kind = il.get("type", "예")
+                    text = il.get("content", "")
+                    if il.get("effect"):
+                        text += f"\n↳ 효과: {il['effect']}"
+                    blocks.append(callout(_t(f"{kind}: {text}"), illus_icons.get(kind, "💡"), "gray_background"))
+
+                for s in pt.get("scriptures") or []:
+                    blocks.append(scripture_toggle(s))
+
+                if pt.get("transition"):
+                    blocks.append(paragraph_labeled("➡️ 연결", pt["transition"]))
+
         blocks.append(divider())
 
-    # ── 성구 분석 (낭설예적 · 배경 · 번역판 · 묵상점) ────────────────────────
-    scripture_analysis = analysis.get("scripture_analysis") or []
-    if scripture_analysis:
-        blocks.append(heading2("📖 성구 분석"))
-        blocks.append(paragraph("각 성구를 낭설예적(낭독·설명·예·적용)으로 다뤘는지, 배경·다른 번역판·깊은 묵상점을 이끌어냈는지 분석합니다."))
-
-        for s in scripture_analysis:
-            ref          = s.get("reference", "")
-            section      = s.get("belongs_to_section", "")
-            is_mandatory = s.get("is_mandatory", False)
-            is_fresh     = s.get("is_fresh_perspective", False)
-            context_bg   = s.get("context_background", "")
-            translation  = s.get("translation_notes")
-            meditation   = s.get("deep_meditation")
-            explanation  = s.get("detailed_explanation", "")
-            illus_detail = s.get("illustration_detail")
-            insight      = s.get("insight_point")
-            application  = s.get("application", "")
-            process      = s.get("process_applied") or {}
-            delivery     = s.get("delivery_technique")
-            six_lens     = s.get("six_lens_analysis") or {}
-
-            if ref:
-                suffix = " ★낭독" if is_mandatory else ""
-                section_suffix = f"  ({section})" if section else ""
-                blocks.append(heading3(_t(f"📖 {ref}{suffix}{section_suffix}")))
-
-            if process:
-                def _mk(v): return "✅" if v else "▫️"
-                blocks.append(paragraph_labeled(
-                    "낭설예적",
-                    f"{_mk(process.get('read_aloud'))} 낭독  "
-                    f"{_mk(process.get('explained'))} 설명  "
-                    f"{_mk(process.get('example_used'))} 예  "
-                    f"{_mk(process.get('application_made'))} 적용"
-                ))
-            if delivery:
-                blocks.append(paragraph_labeled("전달기법 평가", delivery))
-
-            if context_bg:
-                blocks.append(paragraph_labeled("배경", context_bg))
-            if translation:
-                blocks.append(paragraph_labeled("번역판 활용", translation))
-            if meditation:
-                blocks.append(callout(_t(f"🪞 깊은 묵상점: {meditation}"), "🪞", "blue_background"))
-
-            if is_fresh:
-                if insight or illus_detail:
-                    blocks.append(fresh_callout(insight, illus_detail))
-            else:
-                if illus_detail:
-                    blocks.append(callout(_t(illus_detail), "💡"))
-
-            if explanation:
-                blocks.append(paragraph(_t(f"해설: {explanation}")))
-            if application:
-                blocks.append(callout(_t(application), "✅"))
-
-            lens_labels = {
-                "expression": "🔍 표현",
-                "author": "🔍 필자",
-                "context": "🔍 배경(심층)",
-                "emotion": "🔍 감정",
-                "timeline": "🔍 연대",
-                "jehovah": "🔍 여호와",
-            }
-            lens_items = [
-                (lens_labels[key], six_lens.get(key))
-                for key in lens_labels
-                if six_lens.get(key)
-            ]
-            if lens_items:
-                blocks.append({
-                    "object": "block", "type": "paragraph",
-                    "paragraph": {"rich_text": [
-                        {
-                            "type": "text",
-                            "text": {"content": "6렌즈 심층 분석"},
-                            "annotations": {"bold": True, "italic": True},
-                        }
-                    ]},
-                })
-                for label, content in lens_items:
-                    blocks.append(paragraph_labeled(label, content))
-
     return blocks
+
+
+def _scripture_children(s: dict) -> list:
+    """성구 하나의 상세 분석 블록 목록 (토글 안에 들어감)."""
+    children: list[dict] = []
+
+    def paragraph(text: str) -> dict:
+        return {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": _t(text)}}]},
+        }
+
+    def paragraph_labeled(label: str, content: str) -> dict:
+        return {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [
+                {"type": "text", "text": {"content": f"{label}: "}, "annotations": {"bold": True}},
+                {"type": "text", "text": {"content": _t(content)}},
+            ]},
+        }
+
+    def callout(text: str, emoji: str, color: str = "default") -> dict:
+        block: dict = {
+            "object": "block", "type": "callout",
+            "callout": {
+                "rich_text": [{"type": "text", "text": {"content": _t(text)}}],
+                "icon": {"type": "emoji", "emoji": emoji},
+            },
+        }
+        if color != "default":
+            block["callout"]["color"] = color
+        return block
+
+    is_fresh     = s.get("is_fresh_perspective", False)
+    context_bg   = s.get("context_background", "")
+    translation  = s.get("translation_notes")
+    meditation   = s.get("deep_meditation")
+    explanation  = s.get("detailed_explanation", "")
+    illus_detail = s.get("illustration_detail")
+    insight      = s.get("insight_point")
+    application  = s.get("application", "")
+    process      = s.get("process_applied") or {}
+    delivery     = s.get("delivery_technique")
+    six_lens     = s.get("six_lens_analysis") or {}
+
+    if process:
+        def _mk(v): return "✅" if v else "▫️"
+        children.append(paragraph_labeled(
+            "낭설예적",
+            f"{_mk(process.get('read_aloud'))} 낭독  "
+            f"{_mk(process.get('explained'))} 설명  "
+            f"{_mk(process.get('example_used'))} 예  "
+            f"{_mk(process.get('application_made'))} 적용"
+        ))
+    if delivery:
+        children.append(paragraph_labeled("전달기법 평가", delivery))
+
+    if context_bg:
+        children.append(paragraph_labeled("배경", context_bg))
+    if translation:
+        children.append(paragraph_labeled("번역판 활용", translation))
+    if meditation:
+        children.append(callout(f"🪞 깊은 묵상점: {meditation}", "🪞", "blue_background"))
+
+    if is_fresh:
+        parts: list[str] = []
+        if illus_detail:
+            parts.append(f"▸ 비유: {illus_detail}")
+        if insight:
+            parts.append(f"▸ 통찰: {insight}")
+        if parts:
+            children.append({
+                "object": "block", "type": "callout",
+                "callout": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": "🌟 독특한 통찰\n"}, "annotations": {"bold": True}},
+                        {"type": "text", "text": {"content": _t("\n".join(parts))}},
+                    ],
+                    "icon": {"type": "emoji", "emoji": "🌟"},
+                    "color": "yellow_background",
+                },
+            })
+    elif illus_detail:
+        children.append(callout(illus_detail, "💡"))
+
+    if explanation:
+        children.append(paragraph(f"해설: {explanation}"))
+    if application:
+        children.append(callout(application, "✅"))
+
+    lens_labels = {
+        "expression": "🔍 표현",
+        "author": "🔍 필자",
+        "context": "🔍 배경(심층)",
+        "emotion": "🔍 감정",
+        "timeline": "🔍 연대",
+        "jehovah": "🔍 여호와",
+    }
+    lens_items = [(lbl, six_lens.get(key)) for key, lbl in lens_labels.items() if six_lens.get(key)]
+    if lens_items:
+        children.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{
+                "type": "text", "text": {"content": "6렌즈 심층 분석"},
+                "annotations": {"bold": True, "italic": True},
+            }]},
+        })
+        for lbl, content in lens_items:
+            children.append(paragraph_labeled(lbl, content))
+
+    return children
