@@ -172,7 +172,7 @@ ANALYSIS_SYSTEM = """당신은 여호와의 증인 공개 연설 분석 전문�
 6. translation_notes와 deep_meditation이 실제 연설 내용에 근거한 것인지 확인하라. 추측이면 null로 수정.
 7. search_tags.scriptures의 모든 성구가 talk_flow 안에 빠짐없이(범위는 묶어서), 중복 없이 들어갔는지, 요점 순서가 실제 연설 순서와 같은지 확인하라.
 8. delivery_technique이 process_applied의 boolean을 단순 재진술하지 않고 질적 평가를 담고 있는지 확인하라.
-9. 검증 완료 후, 오직 완성된 JSON만 출력하라."""
+9. 위 검토는 출력하기 전에 속으로만 하라. 응답에는 최종 JSON 객체 하나만 출력하고, 검토 메모·설명·수정 전 초안·두 번째 JSON을 덧붙이지 마라."""
 
 LENS_SYSTEM = """당신은 여호와의 증인 공개 연설에 쓰인 성구를 깊이 연구하는 성서 분석가입니다.
 주어진 성구 하나를 6가지 렌즈로 분석해 아래 JSON 형식으로만 응답하세요.
@@ -371,8 +371,29 @@ def _parse_json_response(text: str) -> dict:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Claude 응답을 JSON으로 파싱할 수 없습니다.\n"
-            f"파싱 오류: {exc}\n"
-            f"원본 응답 앞부분:\n{text[:500]}"
-        ) from exc
+        first_error = exc
+
+    # JSON 앞뒤에 설명이 붙었거나, 검토 후 고친 JSON을 한 번 더 붙인 경우:
+    # 응답 안의 JSON 객체를 모두 찾아, 충분히 큰 것 중 마지막(=최종본)을 쓴다.
+    decoder = json.JSONDecoder()
+    found: list[tuple[int, dict]] = []
+    pos = cleaned.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(cleaned, pos)
+        except json.JSONDecodeError:
+            pos = cleaned.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict):
+            found.append((end - pos, obj))
+        pos = cleaned.find("{", end)
+
+    if found:
+        largest = max(size for size, _ in found)
+        return [obj for size, obj in found if size >= largest * 0.5][-1]
+
+    raise ValueError(
+        f"Claude 응답을 JSON으로 파싱할 수 없습니다.\n"
+        f"파싱 오류: {first_error}\n"
+        f"원본 응답 앞부분:\n{text[:500]}"
+    ) from first_error

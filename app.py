@@ -35,7 +35,7 @@ from notion_db import create_talk
 from transcriber import transcribe
 
 # 배포 확인용 버전 — 코드를 바꿔 배포할 때마다 올린다 (화면 상단에 표시됨)
-APP_VERSION = "v2.4 (2026-11-05) · 파일 이름으로 강연 정보 자동 입력 + 주제 확인"
+APP_VERSION = "v2.5 (2026-11-05) · AI 분석 결과 읽기 오류 수정"
 
 # ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
