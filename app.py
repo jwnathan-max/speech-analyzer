@@ -32,6 +32,9 @@ load_dotenv()
 from analyzer import analyze_speech
 from notion_db import create_talk
 
+# 배포 확인용 버전 — 코드를 바꿔 배포할 때마다 올린다 (화면 상단에 표시됨)
+APP_VERSION = "v2.1 (2026-11-05) · 강연 흐름 분석 + 버전 표시"
+
 # ── 페이지 설정 ─────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -433,7 +436,7 @@ def render_results(analysis: dict, notion_url: str = "") -> None:
 # ── 메인 헤더 ─────────────────────────────────────────────────────────────────
 
 st.title("🎙️ 공개강연 AI 분석기")
-st.caption("공개강연 음성 분석 · Notion 자동 저장")
+st.caption(f"공개강연 음성 분석 · Notion 자동 저장 · **{APP_VERSION}**")
 st.divider()
 
 # ── 입력 폼 ───────────────────────────────────────────────────────────────────
